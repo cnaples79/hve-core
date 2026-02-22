@@ -1,4 +1,4 @@
-#Requires -Modules Pester
+﻿#Requires -Modules Pester
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: MIT
 <#
@@ -21,15 +21,12 @@ BeforeAll {
     Import-Module $script:ModulePath -Force
     Import-Module $script:CIHelpersPath -Force
 
-    $script:OriginalSkipMain = $env:HVE_SKIP_MAIN
-    $env:HVE_SKIP_MAIN = '1'
     . $script:ScriptPath
 }
 
 AfterAll {
     Remove-Module LintingHelpers -Force -ErrorAction SilentlyContinue
     Remove-Module CIHelpers -Force -ErrorAction SilentlyContinue
-    $env:HVE_SKIP_MAIN = $script:OriginalSkipMain
 }
 
 #region Link-Lang-Check Invocation Tests
@@ -73,7 +70,8 @@ Describe 'Invoke-LinkLanguageCheckCore' -Tag 'Unit' {
     Context 'Issues found in link scan' {
         BeforeEach {
             $script:RepoRoot = $TestDrive
-                        $script:MockLinkLang = Join-Path $TestDrive 'mock-link-lang.ps1'
+            $script:MockLinkLang = Join-Path $TestDrive 'mock-link-lang.ps1'
+            $script:WriteHostMessages = @()
 
                         @'
 param([string[]]$ExcludePaths = @())
@@ -100,7 +98,10 @@ Write-Output $json
             Mock Set-CIOutput { }
             Mock Set-CIEnv { }
             Mock Write-CIStepSummary { }
-            Mock Write-Host { }
+            Mock Write-Host {
+                param($Object)
+                $script:WriteHostMessages += [string]$Object
+            }
         }
 
         It 'Returns failure exit code and records outputs' {
@@ -108,6 +109,16 @@ Write-Output $json
             Should -Invoke Set-CIOutput -Times 1
             Should -Invoke Set-CIEnv -Times 1
             Should -Invoke Write-CIAnnotation -Times 2
+            Should -Invoke Write-CIStepSummary -Times 1
+
+            Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*📄 docs/a.md*' }
+            Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*📄 docs/b.md*' }
+            Should -Invoke Write-Host -ParameterFilter { $Object -like '*Line 1:*' }
+            Should -Invoke Write-Host -ParameterFilter { $Object -like '*Line 2:*' }
+            Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*failed with 2 issue*' }
+
+            $script:WriteHostMessages | Should -Contain '📄 docs/a.md'
+            $script:WriteHostMessages | Should -Contain '📄 docs/b.md'
         }
     }
 
@@ -136,13 +147,20 @@ Write-Output $json
 
             Mock Set-CIOutput { }
             Mock Write-CIStepSummary { }
-            Mock Write-Host { }
+            Mock Write-Host {
+                param($Object)
+                $script:WriteHostMessages += [string]$Object
+            }
         }
 
         It 'Returns success exit code and records outputs' {
+            $script:WriteHostMessages = @()
             Invoke-LinkLanguageCheckCore -ExcludePaths @() | Should -Be 0
             Should -Invoke Set-CIOutput -Times 1
             Should -Invoke Write-CIStepSummary -Times 1
+            Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*✅ No URLs with language paths found*' }
+            Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*📄*' }
+            Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*⚠️*' }
         }
     }
 }

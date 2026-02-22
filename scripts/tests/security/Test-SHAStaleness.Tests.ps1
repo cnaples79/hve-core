@@ -1,4 +1,4 @@
-#Requires -Modules Pester
+﻿#Requires -Modules Pester
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: MIT
 
@@ -8,14 +8,15 @@
 
 .DESCRIPTION
     Tests the staleness checking functions without executing the main script.
-    Uses AST function extraction to avoid running main execution block.
+    Uses dot-source guard pattern for function isolation.
 #>
 
 BeforeAll {
     $scriptPath = Join-Path $PSScriptRoot '../../security/Test-SHAStaleness.ps1'
-    $script:OriginalSkipMain = $env:HVE_SKIP_MAIN
-    $env:HVE_SKIP_MAIN = '1'
     . $scriptPath
+    # Re-import CIHelpers so Pester can resolve its commands for mocking;
+    # the nested-module import inside SecurityHelpers shadows the standalone copy.
+    Import-Module (Join-Path $PSScriptRoot '../../lib/Modules/CIHelpers.psm1') -Force
 
     $mockPath = Join-Path $PSScriptRoot '../Mocks/GitMocks.psm1'
     Import-Module $mockPath -Force
@@ -30,7 +31,6 @@ BeforeAll {
 AfterAll {
     # Restore environment after tests
     Restore-CIEnvironment
-    $env:HVE_SKIP_MAIN = $script:OriginalSkipMain
 }
 
 Describe 'Test-GitHubToken' -Tag 'Unit' {
@@ -132,26 +132,6 @@ Describe 'Invoke-GitHubAPIWithRetry' -Tag 'Unit' {
 
             $headers = @{ 'Authorization' = 'Bearer test' }
             { Invoke-GitHubAPIWithRetry -Uri 'https://api.github.com/graphql' -Method 'POST' -Headers $headers -Body '{}' } | Should -Throw
-        }
-    }
-}
-
-Describe 'Write-SecurityLog' -Tag 'Unit' {
-    Context 'Log output' {
-        It 'Does not throw for Info level' {
-            { Write-SecurityLog -Message 'Test message' -Level Info } | Should -Not -Throw
-        }
-
-        It 'Does not throw for Warning level' {
-            { Write-SecurityLog -Message 'Warning message' -Level Warning } | Should -Not -Throw
-        }
-
-        It 'Does not throw for Error level' {
-            { Write-SecurityLog -Message 'Error message' -Level Error } | Should -Not -Throw
-        }
-
-        It 'Does not throw for Success level' {
-            { Write-SecurityLog -Message 'Success message' -Level Success } | Should -Not -Throw
         }
     }
 }
@@ -326,9 +306,6 @@ Describe 'Main Script Execution' {
 
     Context 'Array coercion in main execution block' {
         BeforeEach {
-            # Clear HVE_SKIP_MAIN so script actually runs main block
-            $env:HVE_SKIP_MAIN = $null
-            
             # Create workflow with SHA-pinned action
             $workflowContent = @'
 name: Test
@@ -346,8 +323,6 @@ jobs:
         }
         
         AfterEach {
-            # Restore HVE_SKIP_MAIN
-            $env:HVE_SKIP_MAIN = '1'
             # Return to original location
             Set-Location $script:OriginalLocation
         }
@@ -464,12 +439,10 @@ jobs:
 
     Context 'CI environment integration' {
         BeforeEach {
-            # Clear HVE_SKIP_MAIN so script actually runs main block
-            $env:HVE_SKIP_MAIN = $null
-            
             # Save original environment
             $script:OriginalGHA = $env:GITHUB_ACTIONS
             $script:OriginalADO = $env:TF_BUILD
+            $script:OriginalGHOutput = $env:GITHUB_OUTPUT
             
             # Create test workflow
             $workflowContent = @'
@@ -488,10 +461,9 @@ jobs:
         }
 
         AfterEach {
-            # Restore HVE_SKIP_MAIN
-            $env:HVE_SKIP_MAIN = '1'
             $env:GITHUB_ACTIONS = $script:OriginalGHA
             $env:TF_BUILD = $script:OriginalADO
+            $env:GITHUB_OUTPUT = $script:OriginalGHOutput
             Set-Location $script:OriginalLocation
         }
 
@@ -553,14 +525,10 @@ jobs:
 
     Context 'Empty and edge case scenarios' {
         BeforeEach {
-            # Clear HVE_SKIP_MAIN so script actually runs main block
-            $env:HVE_SKIP_MAIN = $null
             Set-Location $script:TestRepo
         }
         
         AfterEach {
-            # Restore HVE_SKIP_MAIN
-            $env:HVE_SKIP_MAIN = '1'
             Set-Location $script:OriginalLocation
         }
         
@@ -644,6 +612,304 @@ jobs:
                 # First item should have required properties
                 $result.Dependencies[0].PSObject.Properties.Name | Should -Contain 'Type'
             }
+        }
+    }
+}
+
+Describe 'Get-BulkGitHubActionsStaleness' -Tag 'Unit' {
+    BeforeAll {
+        Save-CIEnvironment
+    }
+    AfterAll {
+        Restore-CIEnvironment
+    }
+
+    Context 'Token resolution' {
+        BeforeEach {
+            $env:GITHUB_TOKEN = ''
+            $env:SYSTEM_ACCESSTOKEN = ''
+            $env:GH_TOKEN = ''
+            $env:BUILD_REPOSITORY_PROVIDER = ''
+        }
+
+        It 'Uses GITHUB_TOKEN when available' {
+            $env:GITHUB_TOKEN = 'ghp_test_token_123'
+            Mock Test-GitHubToken { return @{ Valid = $true; Authenticated = $true; RateLimit = @{ remaining = 5000 }; Message = '' } }
+            Mock Invoke-GitHubAPIWithRetry {
+                return @{
+                    data = @{
+                        rateLimit = @{ remaining = 5000 }
+                        repo0     = @{ defaultBranchRef = @{ target = @{ oid = 'bbbb' * 10; committedDate = (Get-Date).ToString('o') } } }
+                    }
+                }
+            }
+
+            $sha = 'aaaa' * 10
+            $null = Get-BulkGitHubActionsStaleness -ActionRepos @('owner/repo') -ShaToActionMap @{
+                "owner/repo@$sha" = @{ Repo = 'owner/repo'; SHA = $sha; File = 'test.yml' }
+            }
+
+            Should -Invoke Test-GitHubToken -Times 1
+        }
+
+        It 'Falls back to GH_TOKEN when GITHUB_TOKEN is empty' {
+            $env:GH_TOKEN = 'ghp_fallback_token'
+            Mock Test-GitHubToken { return @{ Valid = $true; Authenticated = $true; RateLimit = @{ remaining = 5000 }; Message = '' } }
+            Mock Invoke-GitHubAPIWithRetry {
+                return @{
+                    data = @{
+                        rateLimit = @{ remaining = 5000 }
+                        repo0     = @{ defaultBranchRef = @{ target = @{ oid = 'bbbb' * 10; committedDate = (Get-Date).ToString('o') } } }
+                    }
+                }
+            }
+
+            $sha = 'aaaa' * 10
+            $null = Get-BulkGitHubActionsStaleness -ActionRepos @('owner/repo') -ShaToActionMap @{
+                "owner/repo@$sha" = @{ Repo = 'owner/repo'; SHA = $sha; File = 'test.yml' }
+            }
+
+            Should -Invoke Test-GitHubToken -Times 1
+        }
+
+        It 'Uses SYSTEM_ACCESSTOKEN for GitHub-hosted ADO repos' {
+            $env:SYSTEM_ACCESSTOKEN = 'ado_token'
+            $env:BUILD_REPOSITORY_PROVIDER = 'GitHub'
+            Mock Test-GitHubToken { return @{ Valid = $true; Authenticated = $true; RateLimit = @{ remaining = 5000 }; Message = '' } }
+            Mock Invoke-GitHubAPIWithRetry {
+                return @{
+                    data = @{
+                        rateLimit = @{ remaining = 5000 }
+                        repo0     = @{ defaultBranchRef = @{ target = @{ oid = 'bbbb' * 10; committedDate = (Get-Date).ToString('o') } } }
+                    }
+                }
+            }
+
+            $sha = 'aaaa' * 10
+            $null = Get-BulkGitHubActionsStaleness -ActionRepos @('owner/repo') -ShaToActionMap @{
+                "owner/repo@$sha" = @{ Repo = 'owner/repo'; SHA = $sha; File = 'test.yml' }
+            }
+
+            Should -Invoke Test-GitHubToken -Times 1
+        }
+    }
+
+    Context 'GraphQL batch processing' {
+        BeforeEach {
+            $env:GITHUB_TOKEN = 'ghp_test_token'
+        }
+
+        It 'Returns stale result when SHA differs and age exceeds threshold' {
+            Mock Test-GitHubToken { return @{ Valid = $true; Authenticated = $true; RateLimit = @{ remaining = 5000 }; Message = '' } }
+
+            $latestSHA = 'bbbb' * 10
+            $currentSHA = 'aaaa' * 10
+            $oldDate = (Get-Date).AddDays(-60).ToString('o')
+            $newDate = (Get-Date).ToString('o')
+
+            # Default branch query
+            Mock Invoke-GitHubAPIWithRetry {
+                return @{
+                    data = @{
+                        rateLimit = @{ remaining = 5000 }
+                        repo0     = @{ defaultBranchRef = @{ target = @{ oid = $latestSHA; committedDate = $newDate } } }
+                    }
+                }
+            } -ParameterFilter { $Body -match 'defaultBranchRef' }
+
+            # Commit query — use [PSCustomObject] so PSObject.Properties iteration works
+            Mock Invoke-GitHubAPIWithRetry {
+                return [PSCustomObject]@{
+                    data = [PSCustomObject]@{
+                        rateLimit = [PSCustomObject]@{ remaining = 5000 }
+                        commit0   = [PSCustomObject]@{
+                            object = [PSCustomObject]@{
+                                oid           = $currentSHA
+                                committedDate = $oldDate
+                            }
+                        }
+                    }
+                }
+            } -ParameterFilter { $Body -match 'commit0' }
+
+            $result = Get-BulkGitHubActionsStaleness -ActionRepos @('actions/checkout') -ShaToActionMap @{
+                "actions/checkout@$currentSHA" = @{ Repo = 'actions/checkout'; SHA = $currentSHA; File = 'ci.yml' }
+            }
+
+            $result | Should -Not -BeNullOrEmpty
+            @($result).Count | Should -BeGreaterOrEqual 1
+        }
+    }
+
+    Context 'Invalid token' {
+        BeforeEach {
+            $env:GITHUB_TOKEN = ''
+            $env:SYSTEM_ACCESSTOKEN = ''
+            $env:GH_TOKEN = ''
+            $env:BUILD_REPOSITORY_PROVIDER = ''
+        }
+
+        It 'Returns empty when no valid token is available' {
+            Mock Test-GitHubToken { return @{ Valid = $false; Authenticated = $false; Message = 'No token' } }
+            Mock Write-SecurityLog { }
+            Mock Invoke-GitHubAPIWithRetry {
+                return @{
+                    data = @{
+                        rateLimit = @{ remaining = 60 }
+                        repo0     = @{ defaultBranchRef = $null }
+                    }
+                }
+            }
+
+            $sha = 'aaaa' * 10
+            $result = Get-BulkGitHubActionsStaleness -ActionRepos @('owner/repo') -ShaToActionMap @{
+                "owner/repo@$sha" = @{ Repo = 'owner/repo'; SHA = $sha; File = 'test.yml' }
+            }
+
+            @($result).Count | Should -Be 0
+        }
+    }
+}
+
+Describe 'Test-GitHubActionsForStaleness' -Tag 'Unit' {
+    BeforeAll {
+        Save-CIEnvironment
+        $script:TestWorkflows = Join-Path $TestDrive '.github' 'workflows'
+        New-Item -ItemType Directory -Path $script:TestWorkflows -Force | Out-Null
+    }
+    AfterAll {
+        Restore-CIEnvironment
+    }
+
+    Context 'Workflow scanning' {
+        It 'Returns empty when no SHA-pinned actions found' {
+            $ymlContent = @'
+name: test
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+'@
+            Set-Content (Join-Path $script:TestWorkflows 'no-sha.yml') -Value $ymlContent
+
+            Push-Location $TestDrive
+            try {
+                Mock Write-SecurityLog { }
+                Mock Get-BulkGitHubActionsStaleness { return @() }
+
+                $null = Test-GitHubActionsForStaleness
+
+                # No SHA-pinned actions found = early return
+                Should -Not -Invoke Get-BulkGitHubActionsStaleness
+            }
+            finally {
+                Pop-Location
+            }
+        }
+
+        It 'Detects SHA-pinned actions in workflow files' {
+            $sha = 'a' * 40
+            $ymlContent = @"
+name: test
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@$sha
+"@
+            Set-Content (Join-Path $script:TestWorkflows 'pinned.yml') -Value $ymlContent
+
+            Push-Location $TestDrive
+            try {
+                Mock Write-SecurityLog { }
+                Mock Get-BulkGitHubActionsStaleness { return @() }
+
+                $null = Test-GitHubActionsForStaleness
+
+                Should -Invoke Get-BulkGitHubActionsStaleness -Times 1
+            }
+            finally {
+                Pop-Location
+            }
+        }
+    }
+
+    Context 'No workflow directory' {
+        It 'Returns empty when .github/workflows does not exist' {
+            $emptyDir = Join-Path $TestDrive 'empty-project'
+            New-Item -ItemType Directory -Path $emptyDir -Force | Out-Null
+
+            Push-Location $emptyDir
+            try {
+                Mock Write-SecurityLog { }
+
+                $result = Test-GitHubActionsForStaleness
+                @($result).Count | Should -Be 0
+            }
+            finally {
+                Pop-Location
+            }
+        }
+    }
+}
+
+Describe 'Invoke-SHAStalenessCheck' -Tag 'Unit' {
+    BeforeAll {
+        Save-CIEnvironment
+    }
+    AfterAll {
+        Restore-CIEnvironment
+    }
+
+    Context 'Log directory creation' {
+        It 'Creates log directory when it does not exist' {
+            $logPath = Join-Path $TestDrive 'staleness-logs' 'test.log'
+            $env:GITHUB_TOKEN = 'ghp_test'
+
+            Mock Test-GitHubActionsForStaleness { return @() }
+            Mock Get-ToolStaleness { }
+            Mock Write-SecurityOutput { }
+            Mock New-Item { } -ParameterFilter { $ItemType -eq 'Directory' }
+            Mock Write-SecurityLog { }
+
+            Invoke-SHAStalenessCheck -OutputFormat 'console' -LogPath $logPath
+
+            Should -Invoke New-Item -Times 1
+        }
+    }
+
+    Context 'FailOnStale behavior' {
+        It 'Throws when stale dependencies are detected and FailOnStale is set' {
+            $env:GITHUB_TOKEN = 'ghp_test'
+            Mock Write-SecurityLog { }
+            Mock New-Item { }
+            Mock Test-GitHubActionsForStaleness {
+                $script:StaleDependencies = @(
+                    @{ Type = 'GitHubAction'; Name = 'actions/checkout'; DaysOld = 45 }
+                )
+            }
+            Mock Get-ToolStaleness { }
+            Mock Write-SecurityOutput { }
+
+            { Invoke-SHAStalenessCheck -OutputFormat 'console' -FailOnStale } |
+                Should -Throw '*Stale dependencies detected*'
+        }
+
+        It 'Does not throw when no stale dependencies and FailOnStale is set' {
+            $env:GITHUB_TOKEN = 'ghp_test'
+            Mock Write-SecurityLog { }
+            Mock New-Item { }
+            Mock Test-GitHubActionsForStaleness {
+                $script:StaleDependencies = @()
+            }
+            Mock Get-ToolStaleness { }
+            Mock Write-SecurityOutput { }
+
+            { Invoke-SHAStalenessCheck -OutputFormat 'console' -FailOnStale } |
+                Should -Not -Throw
         }
     }
 }

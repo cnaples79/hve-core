@@ -77,53 +77,14 @@ $ErrorActionPreference = 'Stop'
 
 # Import CIHelpers for workflow command escaping
 Import-Module (Join-Path $PSScriptRoot '../lib/Modules/CIHelpers.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'Modules/SecurityHelpers.psm1') -Force
 
-$script:SkipMain = $env:HVE_SKIP_MAIN -eq '1'
+# Route Write-SecurityLog output through script-scoped format and log path
+$PSDefaultParameterValues['Write-SecurityLog:OutputFormat'] = $OutputFormat
+$PSDefaultParameterValues['Write-SecurityLog:LogPath'] = $LogPath
 
-# Ensure logging directory exists
-$LogDir = Split-Path -Parent $LogPath
-if (!(Test-Path $LogDir)) {
-    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
-}
-
-function Write-SecurityLog {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-
-        [Parameter(Mandatory = $false)]
-        [ValidateSet("Info", "Warning", "Error", "Success")]
-        [string]$Level = "Info"
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Message)) {
-        $Message = "Empty log message"
-    }
-
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logEntry = "[$timestamp] [$Level] $Message"
-
-    # Console output with colors (only in console mode)
-    if ($OutputFormat -eq "console") {
-        switch ($Level) {
-            "Info" { Write-Host $logEntry -ForegroundColor Cyan }
-            "Warning" { Write-Host $logEntry -ForegroundColor Yellow }
-            "Error" { Write-Host $logEntry -ForegroundColor Red }
-            "Success" { Write-Host $logEntry -ForegroundColor Green }
-        }
-    }
-
-    # File logging
-    try {
-        Add-Content -Path $LogPath -Value $logEntry -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Error "Failed to write to log file: $($_.Exception.Message)" -ErrorAction SilentlyContinue
-    }
-}
-
-# Structure to hold stale dependency information
-$StaleDependencies = @()
+# Script-scope collection of stale dependencies (used by multiple functions)
+$script:StaleDependencies = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 function Test-GitHubToken {
     param(
@@ -548,7 +509,7 @@ function Test-GitHubActionsForStaleness {
 
         foreach ($result in $bulkResults) {
             if ($result.IsStale) {
-                $script:StaleDependencies += [PSCustomObject]@{
+                $script:StaleDependencies.Add([PSCustomObject]@{
                     Type           = "GitHubAction"
                     File           = $result.File
                     Name           = $result.ActionRepo
@@ -557,7 +518,7 @@ function Test-GitHubActionsForStaleness {
                     DaysOld        = $result.DaysOld
                     Severity       = if ($result.DaysOld -gt 90) { "High" } elseif ($result.DaysOld -gt 60) { "Medium" } else { "Low" }
                     Message        = "GitHub Action is $($result.DaysOld) days old (current: $($result.CurrentSHA.Substring(0,8)), latest: $($result.LatestSHA.Substring(0,8)))"
-                }
+                })
 
                 Write-SecurityLog "Found stale GitHub Action: $($result.ActionRepo) ($($result.DaysOld) days old)" -Level Warning
             }
@@ -617,7 +578,7 @@ function Test-GitHubActionsForStaleness {
                     $DaysOld = [Math]::Round((Get-Date).Subtract($CurrentDate).TotalDays)
 
                     if ($DaysOld -gt $MaxAge) {
-                        $script:StaleDependencies += [PSCustomObject]@{
+                        $script:StaleDependencies.Add([PSCustomObject]@{
                             Type           = "GitHubAction"
                             File           = $action.File
                             Name           = $action.Repo
@@ -626,7 +587,7 @@ function Test-GitHubActionsForStaleness {
                             DaysOld        = $DaysOld
                             Severity       = if ($DaysOld -gt 90) { "High" } elseif ($DaysOld -gt 60) { "Medium" } else { "Low" }
                             Message        = "GitHub Action is $DaysOld days old (current: $($action.SHA.Substring(0,8)), latest: $($LatestSHA.Substring(0,8)))"
-                        }
+                        })
 
                         Write-SecurityLog "Found stale GitHub Action (fallback): $($action.Repo) ($DaysOld days old)" -Level Warning
                     }
@@ -661,7 +622,7 @@ function Test-GitHubActionsForStaleness {
     }
 }
 
-function Write-OutputResult {
+function Write-SecurityOutput {
     param(
         [Parameter(Mandatory = $false)]
         [array]$Dependencies = @(),
@@ -684,7 +645,6 @@ function Write-OutputResult {
             } | ConvertTo-Json -Depth 10
 
             try {
-                # Ensure output directory exists
                 $OutputDir = Split-Path -Parent $OutputPath
                 if (!(Test-Path $OutputDir)) {
                     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
@@ -877,15 +837,45 @@ function Get-ToolStaleness {
 }
 
 #region Main Execution
-if (-not $script:SkipMain) {
-    try {
+
+function Invoke-SHAStalenessCheck {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("json", "azdo", "github", "console", "BuildWarning", "Summary")]
+        [string]$OutputFormat = "console",
+
+        [Parameter(Mandatory = $false)]
+        [int]$MaxAge = 30,
+
+        [Parameter(Mandatory = $false)]
+        [string]$LogPath = "./logs/sha-staleness-monitoring.log",
+
+        [Parameter(Mandatory = $false)]
+        [string]$OutputPath = "./logs/sha-staleness-results.json",
+
+        [Parameter(Mandatory = $false)]
+        [switch]$FailOnStale,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 50)]
+        [int]$GraphQLBatchSize = 20
+    )
+
+    # Ensure logging directory exists (relocated from script scope)
+    $LogDir = Split-Path -Parent $LogPath
+    if (!(Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
     Write-SecurityLog "Starting SHA staleness monitoring..." -Level Info
     Write-SecurityLog "Max age threshold: $MaxAge days" -Level Info
     Write-SecurityLog "GraphQL batch size: $GraphQLBatchSize queries per request" -Level Info
     Write-SecurityLog "Output format: $OutputFormat" -Level Info
 
-    # Initialize stale dependencies array
-    $script:StaleDependencies = @()
+    # Reset stale dependencies for this run
+    $script:StaleDependencies = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     # Run staleness check for GitHub Actions
     Test-GitHubActionsForStaleness
@@ -900,54 +890,53 @@ if (-not $script:SkipMain) {
             Write-SecurityLog "Found $(@($staleTools).Count) stale tool(s):" -Level Warning
             foreach ($tool in $staleTools) {
                 Write-SecurityLog "  - $($tool.Tool): $($tool.CurrentVersion) -> $($tool.LatestVersion)" -Level Warning
-                
-                # Add to global stale dependencies for output
-                $script:StaleDependencies += [PSCustomObject]@{
+
+                $script:StaleDependencies.Add([PSCustomObject]@{
                     Type           = "Tool"
                     File           = "scripts/security/tool-checksums.json"
                     Name           = $tool.Tool
                     CurrentVersion = $tool.CurrentVersion
                     LatestVersion  = $tool.LatestVersion
-                    DaysOld        = $null  # Not tracked for tools
+                    DaysOld        = $null
                     Severity       = "Medium"
                     Message        = "Tool has newer version available: $($tool.CurrentVersion) -> $($tool.LatestVersion)"
-                }
+                })
             }
         }
         else {
             Write-SecurityLog "All tools are up to date" -Level Info
         }
 
-        # Check for errors
         $errorTools = @($toolResults | Where-Object { $null -ne $_.Error })
         if (@($errorTools).Count -gt 0) {
             Write-SecurityLog "Failed to check $(@($errorTools).Count) tool(s)" -Level Warning
         }
     }
 
-    # Output results
-    Write-OutputResult -Dependencies $StaleDependencies -OutputFormat $OutputFormat -OutputPath $OutputPath
+    Write-SecurityOutput -Dependencies $script:StaleDependencies -OutputFormat $OutputFormat -OutputPath $OutputPath
 
     Write-SecurityLog "SHA staleness monitoring completed" -Level Success
-    Write-SecurityLog "Stale dependencies found: $(@($StaleDependencies).Count)" -Level Info
+    Write-SecurityLog "Stale dependencies found: $(@($script:StaleDependencies).Count)" -Level Info
 
-    # Exit with appropriate code based on findings and -FailOnStale parameter
-    if (@($StaleDependencies).Count -gt 0) {
-        if ($FailOnStale) {
-            Write-SecurityLog "Exiting with status 1 due to stale dependencies (-FailOnStale specified)" -Level Warning
-            exit 1
-        }
-        else {
-            Write-SecurityLog "Stale dependencies found but exiting with status 0 (use -FailOnStale to fail build)" -Level Warning
-            exit 0
-        }
+    if (@($script:StaleDependencies).Count -gt 0 -and $FailOnStale) {
+        throw "Stale dependencies detected ($(@($script:StaleDependencies).Count) found)"
     }
-    exit 0  # All good
+
+    if (@($script:StaleDependencies).Count -gt 0) {
+        Write-SecurityLog "Stale dependencies found but not failing (use -FailOnStale to fail build)" -Level Warning
+    }
 }
-catch {
-    Write-Error -ErrorAction Continue "Test SHA Staleness failed: $($_.Exception.Message)"
-    Write-CIAnnotation -Message $_.Exception.Message -Level Error
-    exit 1
+
+if ($MyInvocation.InvocationName -ne '.') {
+    try {
+        Invoke-SHAStalenessCheck -OutputFormat $OutputFormat -MaxAge $MaxAge -LogPath $LogPath -OutputPath $OutputPath -FailOnStale:$FailOnStale -GraphQLBatchSize $GraphQLBatchSize
+        exit 0
+    }
+    catch {
+        Write-Error -ErrorAction Continue "Test-SHAStaleness failed: $($_.Exception.Message)"
+        Write-CIAnnotation -Message $_.Exception.Message -Level Error
+        exit 1
+    }
 }
-}
-#endregion
+
+#endregion Main Execution

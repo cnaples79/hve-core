@@ -1,9 +1,12 @@
-#Requires -Modules Pester
+﻿#Requires -Modules Pester
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: MIT
 
 BeforeAll {
     . $PSScriptRoot/../../security/Test-DependencyPinning.ps1
+    # Re-import CIHelpers so Pester can resolve its commands for mocking;
+    # the nested-module import inside SecurityHelpers shadows the standalone copy.
+    Import-Module (Join-Path $PSScriptRoot '../../lib/Modules/CIHelpers.psm1') -Force
 
     $mockPath = Join-Path $PSScriptRoot '../Mocks/GitMocks.psm1'
     Import-Module $mockPath -Force
@@ -11,6 +14,15 @@ BeforeAll {
     # Fixture paths
     $script:FixturesPath = Join-Path $PSScriptRoot '../Fixtures/Workflows'
     $script:SecurityFixturesPath = Join-Path $PSScriptRoot '../Fixtures/Security'
+
+    # CI helper mocks — suppress console output and enable assertions
+    Mock Write-Host {}
+    Mock Write-CIAnnotation {}
+    Mock Write-CIStepSummary {}
+    # Module-scoped mocks — intercept calls from within SecurityHelpers module
+    Mock Write-Host {} -ModuleName SecurityHelpers
+    Mock Write-CIAnnotation {} -ModuleName SecurityHelpers
+    Mock Write-CIStepSummary {} -ModuleName SecurityHelpers
 }
 
 Describe 'Test-SHAPinning' -Tag 'Unit' {
@@ -355,17 +367,6 @@ Describe 'Dot-sourced execution protection' -Tag 'Unit' {
             Test-Path $tempOutputPath | Should -BeFalse
         }
 
-        It 'Writes error message when dot-sourced' {
-            # Arrange
-            $testScript = Join-Path $PSScriptRoot '../../security/Test-DependencyPinning.ps1'
-            
-            # Act - Invoke in new process to test dot-sourcing error handling
-            $result = pwsh -Command ". '$testScript'" 2>&1
-            $errorOutput = $result | Where-Object { $_ -match 'dot-sourced' -or $_ -match 'will not execute' }
-            
-            # Assert - Should write error message about dot-sourcing
-            $errorOutput | Should -Not -BeNullOrEmpty
-        }
     }
 }
 
@@ -707,6 +708,466 @@ Describe 'Get-NpmDependencyViolations' -Tag 'Unit' {
 
             $violations.Count | Should -BeGreaterThan 0
             $violations | Where-Object { $_.Name -eq 'valid-package' } | Should -Not -BeNullOrEmpty
+        }
+    }
+}
+
+Describe 'Get-RemediationSuggestion' -Tag 'Unit' {
+    Context 'Without -Remediate flag' {
+        It 'Returns enable-flag message' {
+            $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'actions/checkout', 'High', 'desc')
+            $v.Version = 'v4'
+            $result = Get-RemediationSuggestion -Violation $v
+            $result | Should -BeLike '*Enable -Remediate flag*'
+        }
+    }
+
+    Context 'GitHub Actions with -Remediate' {
+        It 'Resolves SHA from API and returns pin suggestion' {
+            $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'actions/checkout', 'High', 'desc')
+            $v.Version = 'v4'
+            $fakeSha = 'a'.PadRight(40, 'b')
+            Mock Invoke-RestMethod { return @{ sha = $fakeSha } }
+            $result = Get-RemediationSuggestion -Violation $v -Remediate
+            $result | Should -BeLike "Pin to SHA: uses: actions/checkout@$fakeSha*"
+        }
+
+        It 'Returns manual fallback when API throws' {
+            $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'actions/checkout', 'High', 'desc')
+            $v.Version = 'v4'
+            Mock Invoke-RestMethod { throw 'API error' }
+            Mock Write-SecurityLog {}
+            $result = Get-RemediationSuggestion -Violation $v -Remediate
+            $result | Should -Be 'Manually research and pin to immutable reference'
+        }
+    }
+
+    Context 'Non-github-actions type with -Remediate' {
+        It 'Returns generic research message' {
+            $v = [DependencyViolation]::new('req.txt', 1, 'pip', 'requests', 'Medium', 'desc')
+            $v.Version = '2.31.0'
+            $result = Get-RemediationSuggestion -Violation $v -Remediate
+            $result | Should -BeLike '*Research and pin*pip*'
+        }
+    }
+}
+
+Describe 'Get-DependencyViolation with ValidationFunc' -Tag 'Unit' {
+    Context 'npm type triggers ValidationFunc path' {
+        BeforeAll {
+            $script:npmFixturePath = Join-Path $script:SecurityFixturesPath 'npm-violations'
+            if (-not (Test-Path $script:npmFixturePath)) {
+                New-Item -ItemType Directory -Path $script:npmFixturePath -Force | Out-Null
+            }
+            $script:pkgPath = Join-Path $script:npmFixturePath 'test-pkg.json'
+            Set-Content -Path $script:pkgPath -Value '{"dependencies":{"lodash":"^4.17.21"}}'
+        }
+
+        It 'Uses ValidationFunc instead of regex patterns' {
+            $fileInfo = @{
+                Path         = $script:pkgPath
+                Type         = 'npm'
+                RelativePath = 'test-pkg.json'
+            }
+            $violations = Get-DependencyViolation -FileInfo $fileInfo
+            $violations | Should -Not -BeNullOrEmpty
+            $violations[0].GetType().Name | Should -Be 'DependencyViolation'
+        }
+
+        It 'Sets File from FileInfo when missing' {
+            $fileInfo = @{
+                Path         = $script:pkgPath
+                Type         = 'npm'
+                RelativePath = 'test-pkg.json'
+            }
+            $violations = Get-DependencyViolation -FileInfo $fileInfo
+            $violations | ForEach-Object { $_.File | Should -Not -BeNullOrEmpty }
+        }
+    }
+}
+
+Describe 'Invoke-DependencyPinningAnalysis' -Tag 'Unit' {
+    BeforeAll {
+        Mock Get-FilesToScan { return @() }
+        Mock Get-ComplianceReportData {
+            return @{
+                ComplianceScore      = 100.0
+                TotalDependencies    = 0
+                UnpinnedDependencies = 0
+                Violations           = @()
+            }
+        }
+        Mock Export-ComplianceReport {}
+        Mock Export-CICDArtifact {}
+    }
+
+    Context 'All dependencies pinned' {
+        It 'Logs success message without throwing' {
+            { Invoke-DependencyPinningAnalysis -Path TestDrive: } | Should -Not -Throw
+        }
+
+        It 'emits success Write-Host message when no violations' {
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+            Should -Invoke Write-Host -ParameterFilter {
+                $Object -like '*✅*' -and $Object -like '*SHA-pinned*'
+            }
+        }
+
+        It 'does not emit Write-CIAnnotation warnings when no violations' {
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+            Should -Not -Invoke Write-CIAnnotation -ParameterFilter {
+                $Level -eq 'Warning'
+            }
+        }
+    }
+
+    Context 'Violations below threshold with -FailOnUnpinned' {
+        BeforeAll {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'High', 'Not pinned')
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{
+                    ComplianceScore      = 50.0
+                    TotalDependencies    = 2
+                    UnpinnedDependencies = 1
+                    Violations           = @()
+                }
+            }
+        }
+
+        It 'Throws when score below threshold and -FailOnUnpinned' {
+            { Invoke-DependencyPinningAnalysis -Path TestDrive: -FailOnUnpinned -Threshold 80 } | Should -Throw '*below threshold*'
+        }
+
+        It 'Does not throw in soft-fail mode' {
+            { Invoke-DependencyPinningAnalysis -Path TestDrive: -Threshold 80 } | Should -Not -Throw
+        }
+    }
+
+    Context 'CI output for violations in soft-fail mode' {
+        BeforeAll {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'High', 'Not pinned')
+                $v.CurrentRef = 'v4'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{
+                    ComplianceScore      = 50.0
+                    TotalDependencies    = 2
+                    UnpinnedDependencies = 1
+                    Violations           = @()
+                }
+            }
+            Mock Export-ComplianceReport {}
+            Mock Export-CICDArtifact {}
+        }
+
+        It 'emits summary header with violation count' {
+            Invoke-DependencyPinningAnalysis -Path TestDrive: -Threshold 80
+            Should -Invoke Write-Host -ParameterFilter {
+                $Object -like '*unpinned*'
+            }
+        }
+
+        It 'emits file header with file icon' {
+            Invoke-DependencyPinningAnalysis -Path TestDrive: -Threshold 80
+            Should -Invoke Write-Host -ParameterFilter {
+                $Object -like '*📄*'
+            }
+        }
+
+        It 'emits per-violation detail line' {
+            Invoke-DependencyPinningAnalysis -Path TestDrive: -Threshold 80
+            Should -Invoke Write-Host -ParameterFilter {
+                $Object -like '*❌*' -and $Object -like '*a/b*'
+            }
+        }
+
+        It 'emits Write-CIAnnotation with Error level for High severity violation' {
+            Invoke-DependencyPinningAnalysis -Path TestDrive: -Threshold 80
+            Should -Invoke Write-CIAnnotation -ParameterFilter {
+                $Level -eq 'Error' -and $File -eq 'f.yml' -and $Line -eq 1
+            }
+        }
+    }
+
+    Context 'Score meets threshold' {
+        BeforeAll {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'Low', 'desc')
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{
+                    ComplianceScore      = 90.0
+                    TotalDependencies    = 10
+                    UnpinnedDependencies = 1
+                    Violations           = @()
+                }
+            }
+        }
+
+        It 'Does not throw when score meets threshold' {
+            { Invoke-DependencyPinningAnalysis -Path TestDrive: -Threshold 80 } | Should -Not -Throw
+        }
+    }
+
+    Context 'CI annotations per violation' {
+        BeforeAll {
+            Mock Write-CIAnnotation {}
+            Mock Write-Host {}
+            Mock Write-CIAnnotation {} -ModuleName SecurityHelpers
+            Mock Write-Host {} -ModuleName SecurityHelpers
+        }
+
+        It 'Emits Write-CIAnnotation per violation' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'High', 'Not pinned')
+                $v.ViolationType = 'Unpinned'
+                $v.Version = 'v4'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 50.0; TotalDependencies = 1; UnpinnedDependencies = 1; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-CIAnnotation -ParameterFilter { $Level -eq 'Error' -and $File -eq 'f.yml' -and $Line -eq 1 } -Times 1 -Exactly
+        }
+
+        It 'Maps High severity to Error level' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 5, 'github-actions', 'actions/checkout', 'High', 'Unpinned action')
+                $v.ViolationType = 'Unpinned'
+                $v.Version = 'v4'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 50.0; TotalDependencies = 1; UnpinnedDependencies = 1; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-CIAnnotation -ParameterFilter { $Level -eq 'Error' -and $File -eq 'f.yml' } -Times 1 -Exactly
+        }
+
+        It 'Maps Medium severity to Warning level' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 3, 'npm', 'lodash', 'Medium', 'Unpinned npm dep')
+                $v.ViolationType = 'Unpinned'
+                $v.Version = '^4.0.0'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 80.0; TotalDependencies = 1; UnpinnedDependencies = 1; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-CIAnnotation -ParameterFilter { $Level -eq 'Warning' -and $File -eq 'f.yml' } -Times 1 -Exactly
+        }
+
+        It 'Maps Low severity to Notice level' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 7, 'github-actions', 'a/b', 'Low', 'Minor issue')
+                $v.ViolationType = 'MissingVersionComment'
+                $v.Version = 'abc123'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'add comment' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 90.0; TotalDependencies = 1; UnpinnedDependencies = 1; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-CIAnnotation -ParameterFilter { $Level -eq 'Notice' } -Times 1 -Exactly
+        }
+
+        It 'Includes violation type in annotation message' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'High', 'Not pinned')
+                $v.ViolationType = 'Unpinned'
+                $v.Version = 'v4'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 50.0; TotalDependencies = 1; UnpinnedDependencies = 1; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-CIAnnotation -ParameterFilter { $Message -match 'Unpinned' }
+        }
+
+        It 'Emits no annotations when no violations' {
+            Mock Get-FilesToScan { return @() }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 100.0; TotalDependencies = 0; UnpinnedDependencies = 0; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-CIAnnotation -Times 0
+        }
+
+        It 'Emits multiple annotations for multiple violations' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v1 = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'High', 'Not pinned')
+                $v1.ViolationType = 'Unpinned'
+                $v1.Version = 'v4'
+                $v2 = [DependencyViolation]::new('f.yml', 5, 'github-actions', 'c/d', 'Medium', 'Also not pinned')
+                $v2.ViolationType = 'Unpinned'
+                $v2.Version = 'v3'
+                return @($v1, $v2)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 50.0; TotalDependencies = 2; UnpinnedDependencies = 2; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-CIAnnotation -ParameterFilter { $null -ne $File } -Times 2 -Exactly
+        }
+    }
+
+    Context 'Write-SecurityLog CI annotation forwarding' {
+        BeforeAll {
+            Mock Write-CIAnnotation {} -ModuleName SecurityHelpers
+            Mock Write-Host {} -ModuleName SecurityHelpers
+        }
+
+        It 'Forwards Warning-level log messages as CI Warning annotations' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'High', 'Not pinned')
+                $v.ViolationType = 'Unpinned'
+                $v.Version = 'v4'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 90.0; TotalDependencies = 2; UnpinnedDependencies = 1; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            # Write-SecurityLog -CIAnnotation "N dependencies require SHA pinning..." emits a Warning annotation
+            Should -Invoke Write-CIAnnotation -ModuleName SecurityHelpers -ParameterFilter { $Level -eq 'Warning' -and $null -eq $File -and $Message -match 'SHA pinning' }
+        }
+
+        It 'Forwards Error-level log messages as CI Error annotations' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'High', 'Not pinned')
+                $v.ViolationType = 'Unpinned'
+                $v.Version = 'v4'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 50.0; TotalDependencies = 1; UnpinnedDependencies = 1; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            # Write-SecurityLog -CIAnnotation "Compliance score ... below threshold" emits an Error annotation
+            Should -Invoke Write-CIAnnotation -ModuleName SecurityHelpers -ParameterFilter { $Level -eq 'Error' -and $null -eq $File -and $Message -match 'below threshold' }
+        }
+
+        It 'Does not forward Info-level log messages as annotations' {
+            Mock Get-FilesToScan { return @() }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 100.0; TotalDependencies = 0; UnpinnedDependencies = 0; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            # Info and Success levels should not produce CI annotations
+            Should -Invoke Write-CIAnnotation -ModuleName SecurityHelpers -ParameterFilter { $null -eq $File } -Times 0
+        }
+    }
+
+    Context 'Per-violation console output' {
+        BeforeAll {
+            Mock Write-CIAnnotation {}
+            Mock Write-Host {}
+            Mock Write-CIAnnotation {} -ModuleName SecurityHelpers
+            Mock Write-Host {} -ModuleName SecurityHelpers
+        }
+
+        It 'Writes colored output for High severity violations' {
+            Mock Get-FilesToScan {
+                return @(@{ Path = 'TestDrive:\f.yml'; Type = 'github-actions'; RelativePath = 'f.yml' })
+            }
+            Mock Get-DependencyViolation {
+                $v = [DependencyViolation]::new('f.yml', 1, 'github-actions', 'a/b', 'High', 'Not pinned')
+                $v.ViolationType = 'Unpinned'
+                $v.Version = 'v4'
+                return @($v)
+            }
+            Mock Get-RemediationSuggestion { return 'pin it' }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 50.0; TotalDependencies = 1; UnpinnedDependencies = 1; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-Host -ParameterFilter { $ForegroundColor -eq 'Red' -and $Object -match 'a/b' }
+        }
+
+        It 'Writes success message when no violations' {
+            Mock Get-FilesToScan { return @() }
+            Mock Get-ComplianceReportData {
+                return @{ ComplianceScore = 100.0; TotalDependencies = 0; UnpinnedDependencies = 0; Violations = @() }
+            }
+
+            Invoke-DependencyPinningAnalysis -Path TestDrive:
+
+            Should -Invoke Write-Host -ParameterFilter { $ForegroundColor -eq 'Green' -and $Object -match 'SHA-pinned' }
         }
     }
 }

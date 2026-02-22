@@ -52,7 +52,7 @@ The magic happens because each phase starts fresh. When you clear context betwee
 
 **Without RPI**, AI thinks: "This looks like a reasonable variable name. I'll use `prefix`."
 
-**With RPI**, Task Researcher finds: "12 existing modules in this repository use `resource_prefix`, not `prefix`. See [variables.tf#L47](../infrastructure/modules/base/variables.tf#L47) for the established pattern."
+**With RPI**, Task Researcher finds: "12 existing modules in this repository use `resource_prefix`, not `prefix`. See `variables.tf#L47` for the established pattern."
 
 When AI knows it cannot implement during research, it stops optimizing for "plausible code" and starts optimizing for "verified truth." The constraint changes the goal.
 
@@ -152,7 +152,7 @@ Use the four-phase workflow ([Task Researcher](task-researcher.md) → [Task Pla
 
 ### rpi-agent: When Simplicity Fits
 
-Use the [autonomous agent](../../.github/agents/rpi-agent.agent.md) when:
+Use the [autonomous agent](../../.github/agents/hve-core/rpi-agent.agent.md) when:
 
 * ✅ **Clear scope**: straightforward feature or bug fix
 * ✅ **Minimal research**: codebase-only investigation

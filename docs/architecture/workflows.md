@@ -2,7 +2,7 @@
 title: Build Workflows
 description: GitHub Actions CI/CD pipeline architecture for validation, security, and release automation
 author: WilliamBerryiii
-ms.date: 2026-01-22
+ms.date: 2026-02-10
 ms.topic: overview
 ---
 
@@ -66,6 +66,7 @@ Individual validation workflows called by orchestration workflows:
 | `ps-script-analyzer.yml`      | PowerShell static analysis      | `npm run lint:ps`          |
 | `table-format.yml`            | Markdown table formatting       | `npm run format:tables`    |
 | `pester-tests.yml`            | PowerShell unit tests           | `npm run test:ps`          |
+| `skill-validation.yml`        | Skill structure validation      | `npm run validate:skills`  |
 | `dependency-pinning-scan.yml` | GitHub Actions pinning          | N/A (PowerShell direct)    |
 | `sha-staleness-check.yml`     | SHA reference freshness         | N/A (PowerShell direct)    |
 | `codeql-analysis.yml`         | CodeQL security scanning        | N/A (GitHub native)        |
@@ -88,12 +89,12 @@ flowchart LR
         LLC[link-lang-check]
         MLC[markdown-link-check]
     end
-    
+
     subgraph "Analysis"
         PSA[psscriptanalyzer]
         PT[pester-tests]
     end
-    
+
     subgraph "Security"
         DPC[dependency-pinning-check]
         NA[npm-audit]
@@ -112,6 +113,7 @@ flowchart LR
 | yaml-lint                | `yaml-lint.yml`               | YAML syntax                    |
 | pester-tests             | `pester-tests.yml`            | PowerShell unit tests          |
 | frontmatter-validation   | `frontmatter-validation.yml`  | AI artifact metadata           |
+| skill-validation         | `skill-validation.yml`        | Skill directory structure      |
 | link-lang-check          | `link-lang-check.yml`         | Link accessibility             |
 | markdown-link-check      | `markdown-link-check.yml`     | Broken links                   |
 | dependency-pinning-check | `dependency-pinning-scan.yml` | Action SHA pinning             |
@@ -133,7 +135,10 @@ flowchart LR
     V5[pester-tests] --> RP
     RP -->|release_created| PKG[extension-package-release]
     PKG --> ATT[attest-and-upload]
+    style RP fill:#f9f,stroke:#333
 ```
+
+Release-please v4 handles `chore`-type commits natively. They are not releasable and do not produce spurious release PRs, so no commit-message guard is needed.
 
 ### Main Branch Jobs
 
@@ -174,23 +179,41 @@ The `weekly-security-maintenance.yml` workflow runs every Sunday at 2AM UTC, pro
 
 ## Extension Publishing
 
-The `extension-publish.yml` workflow handles VS Code extension marketplace publishing through manual dispatch.
+The `extension-publish.yml` and `extension-publish-prerelease.yml` workflows handle VS Code extension marketplace publishing through manual dispatch. Both workflows use collection-based packaging to produce and publish a separate VSIX per collection.
 
 ```mermaid
 flowchart LR
-    PC[prepare-changelog] --> PKG[package]
-    NV[normalize-version] --> PKG
-    PKG --> PUB[publish]
+    PC[prepare-changelog] --> DC[discover-collections]
+    NV[normalize-version] --> DC
+    DC --> PKG["package (matrix)"]
+    PKG --> PUB["publish (matrix)"]
 ```
 
 ### Publishing Jobs
 
-| Job               | Purpose                                  |
-|-------------------|------------------------------------------|
-| prepare-changelog | Extract release notes from CHANGELOG.md  |
-| normalize-version | Ensure version consistency               |
-| package           | Build VSIX using `extension-package.yml` |
-| publish           | Upload to VS Code Marketplace via vsce   |
+| Job                  | Purpose                                                     |
+|----------------------|-------------------------------------------------------------|
+| prepare-changelog    | Extract release notes from CHANGELOG.md                     |
+| normalize-version    | Ensure version consistency                                  |
+| validate-version     | Enforce ODD minor version for pre-release channel           |
+| discover-collections | Scan collection manifests, filter by maturity and channel   |
+| package (matrix)     | Build one VSIX per collection using `extension-package.yml` |
+| publish (matrix)     | Upload each VSIX to VS Code Marketplace via OIDC + vsce     |
+
+### Collection-Based Packaging
+
+Collection manifests in `collections/*.collection.yml` define collection-scoped subsets of the full artifact set. The `extension-package.yml` reusable workflow discovers these manifests, filters by maturity and channel, and packages each as an independent VSIX.
+
+| Collection     | Maturity     | Included In        |
+|----------------|--------------|--------------------|
+| `hve-core-all` | Stable       | Stable, PreRelease |
+| `developer`    | Experimental | PreRelease only    |
+
+Maturity filtering rules:
+
+* **Deprecated** collections are always excluded.
+* **Experimental** collections are excluded from Stable channel builds.
+* **Stable** collections are included in all channel builds.
 
 ### Version Channels
 
@@ -214,6 +237,7 @@ Workflows invoke validation through npm scripts defined in `package.json`:
 | `lint:ps`          | `Invoke-PSScriptAnalyzer.ps1`      | ps-script-analyzer.yml     |
 | `format:tables`    | `markdown-table-formatter`         | table-format.yml           |
 | `test:ps`          | `Invoke-Pester`                    | pester-tests.yml           |
+| `validate:skills`  | `Validate-SkillStructure.ps1`      | skill-validation.yml       |
 
 ## Related Documentation
 

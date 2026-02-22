@@ -1,0 +1,31 @@
+id: coding-standards
+name: Coding Standards
+description: Language-specific coding instructions for bash, Bicep, C#, Python, and Terraform projects
+tags:
+  - coding-standards
+  - bash
+  - bicep
+  - csharp
+  - python
+  - terraform
+  - uv
+items:
+  # Instructions
+  - path: .github/instructions/coding-standards/bash/bash.instructions.md
+    kind: instruction
+  - path: .github/instructions/coding-standards/bicep/bicep.instructions.md
+    kind: instruction
+  - path: .github/instructions/coding-standards/csharp/csharp.instructions.md
+    kind: instruction
+  - path: .github/instructions/coding-standards/csharp/csharp-tests.instructions.md
+    kind: instruction
+  - path: .github/instructions/coding-standards/python-script.instructions.md
+    kind: instruction
+  - path: .github/instructions/coding-standards/terraform/terraform.instructions.md
+    kind: instruction
+  - path: .github/instructions/coding-standards/uv-projects.instructions.md
+    kind: instruction
+  - path: .github/instructions/shared/hve-core-location.instructions.md
+    kind: instruction
+display:
+  ordering: alpha

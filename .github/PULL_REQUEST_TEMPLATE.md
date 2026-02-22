@@ -95,8 +95,10 @@ The following validation commands must pass before merging:
 - [ ] Markdown linting: `npm run lint:md`
 - [ ] Spell checking: `npm run spell-check`
 - [ ] Frontmatter validation: `npm run lint:frontmatter`
+- [ ] Skill structure validation: `npm run validate:skills`
 - [ ] Link validation: `npm run lint:md-links`
 - [ ] PowerShell analysis: `npm run lint:ps`
+- [ ] Plugin freshness: `npm run plugin:generate`
 
 ## Security Considerations
 <!-- ⚠️ WARNING: Do not commit sensitive information such as API keys, passwords, or personal data -->
